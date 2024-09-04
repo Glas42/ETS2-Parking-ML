@@ -1,0 +1,12 @@
+# ignore pycache everywhere
+**/__pycache__
+
+# ignore the models
+/Models/*
+
+# ignore the datasets
+/Datasets/Raw/*
+/Datasets/Final/*
+
+# ignore the tensorboard logs
+/Training/logs/*
