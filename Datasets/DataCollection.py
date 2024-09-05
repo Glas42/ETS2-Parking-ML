@@ -5,6 +5,7 @@ import ScreenCapture
 import numpy as np
 import keyboard
 import torch
+import json
 import math
 import time
 import cv2
@@ -29,6 +30,7 @@ State = False
 Key = "f"
 
 CAPTURE = []
+FRAMES = []
 
 cv2.namedWindow(NAME, cv2.WINDOW_NORMAL)
 
@@ -222,6 +224,8 @@ while True:
     if width <= 0 or height <= 0:
         continue
 
+    background = BACKGROUND.copy()
+
 
     truck_x = data["api"]["truckPlacement"]["coordinateX"]
     truck_y = data["api"]["truckPlacement"]["coordinateY"]
@@ -340,15 +344,76 @@ while True:
         State = not State
     LastKeyPressed = KeyPressed
 
+    if LastCapture + 1/CaptureFps < CurrentTime and State == True and data["api"]["pause"] == False:
+        LastCapture = CurrentTime
+        FRAMES.append(frame.copy())
+        CAPTURE.append({"Time": CurrentTime,
+                        "Frame": len(FRAMES) - 1,
+                        "X": truck_x,
+                        "Y": truck_z,
+                        "Steering": data["api"]["truckFloat"]["gameSteer"],
+                        "Throttle": data["api"]["truckFloat"]["gameThrottle"],
+                        "Brake": data["api"]["truckFloat"]["gameBrake"],
+                        "Speed": data["api"]["truckFloat"]["speed"],
+                        "Rotation": truck_rotation_x})
+
     if LastState == True and State == False:
-        # export the capture
-        ...
+        TargetX = CAPTURE[-1]["X"]
+        TargetY = CAPTURE[-1]["Y"]
+        TargetRotation = CAPTURE[-1]["Rotation"]
+        FolderName = "Capture_" + str(len(os.listdir(f"{PATH}Datasets/Raw")))
+        os.mkdir(f"{PATH}Datasets/Raw/{FolderName}")
+        for i, data in enumerate(CAPTURE):
+            data["X"] = data["X"] - TargetX
+            data["Y"] = data["Y"] - TargetY
+            data["Rotation"] = data["Rotation"] - TargetRotation
+            cv2.imwrite(f"{PATH}Datasets/Raw/{FolderName}/{i}.png", FRAMES[CAPTURE[i]["Frame"]])
+            with open(f"{PATH}Datasets/Raw/{FolderName}/{i}.json", "w") as f:
+                json.dump(data, f, indent=4)
+        CAPTURE = []
+        FRAMES = []
+    LastState = State
 
-    BACKGROUND[0:BACKGROUND.shape[0] - 1, 0:round(BACKGROUND.shape[1] * 0.5)] = cv2.resize(frame, (round(BACKGROUND.shape[1] * 0.5), round(BACKGROUND.shape[0] - 1)))
+    background[0:background.shape[0] - 1, 0:round(background.shape[1] * 0.5)] = cv2.resize(frame, (round(background.shape[1] * 0.5), round(background.shape[0] - 1)))
 
-    x1, y1, x2, y2 = round(BACKGROUND.shape[1] * 0.5 + 10), round(BACKGROUND.shape[0] - BACKGROUND.shape[1] * 0.5 + 9), BACKGROUND.shape[1] - 11, BACKGROUND.shape[0] - 11
-    cv2.rectangle(BACKGROUND, (x1, y1), (x2, y2), (0, 255, 0) if State else (0, 0, 255), 1)
+    x1, y1, x2, y2 = round(background.shape[1] * 0.5 + 10), round(background.shape[0] - background.shape[1] * 0.5 + 9), background.shape[1] - 11, background.shape[0] - 11
+    cv2.rectangle(background, (x1, y1), (x2, y2), (0, 255, 0) if State else (0, 0, 255), 1)
 
+    if len(CAPTURE) > 1:
+        min_x = min([data["X"] for data in CAPTURE])
+        max_x = max([data["X"] for data in CAPTURE])
+        min_y = min([data["Y"] for data in CAPTURE])
+        max_y = max([data["Y"] for data in CAPTURE])
 
-    cv2.imshow(NAME, BACKGROUND)
+        converted_points = []
+        if min_x == max_x:
+            min_x -= 1
+            max_x += 1
+        if min_y == max_y:
+            min_y -= 1
+            max_y += 1
+        scale = min((x2 - x1) / (max_x - min_x), (y2 - y1) / (max_y - min_y))
+        for i, data in enumerate(CAPTURE):
+            if i == 0:
+                continue
+            x, y = data["X"], data["Y"]
+            last_x, last_y = CAPTURE[i - 1]["X"], CAPTURE[i - 1]["Y"]
+
+            x = (x - min_x) * scale
+            y = (y - min_y) * scale
+            last_x = (last_x - min_x) * scale
+            last_y = (last_y - min_y) * scale
+            converted_points.append((last_x, last_y))
+            converted_points.append((x, y))
+
+        path_width = max([point[0] for point in converted_points]) - min([point[0] for point in converted_points])
+        path_height = max([point[1] for point in converted_points]) - min([point[1] for point in converted_points])
+        for i, point in enumerate(converted_points):
+            if i == 0:
+                continue
+            x, y = point
+            last_x, last_y = converted_points[i - 1]
+            cv2.line(background, (round((x1 + x2) / 2 - path_width / 2 + x), round((y1 + y2) / 2 - path_height / 2 + y)), (round((x1 + x2) / 2 - path_width / 2 + last_x), round((y1 + y2) / 2 - path_height / 2 + last_y)), (255, 255, 255), 1)
+
+    cv2.imshow(NAME, background)
     cv2.waitKey(1)
