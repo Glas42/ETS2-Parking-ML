@@ -6,8 +6,8 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.amp import GradScaler, autocast
 from torchvision import transforms
 import torch.nn.functional as F
 import torch.optim as optim
@@ -27,30 +27,44 @@ PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 DATA_PATH = PATH + "\\Datasets\\Final"
 MODEL_PATH = PATH + "\\Models"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-NUM_EPOCHS = 100
-BATCH_SIZE = 100
+NUM_EPOCHS = 1000
+BATCH_SIZE = 16
+INPUTS = 3
+OUTPUTS = 1
 IMG_WIDTH = 100
 IMG_HEIGHT = 100
-LEARNING_RATE = 0.0001
-MAX_LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.001
+MAX_LEARNING_RATE = 0.001
 TRAIN_VAL_RATIO = 0.8
 NUM_WORKERS = 0
-DROPOUT = 0.5
-PATIENCE = -1
+DROPOUT = 0.1
+PATIENCE = 50
 SHUFFLE = True
 PIN_MEMORY = False
 DROP_LAST = True
 CACHE = True
 
-OUTPUTS = None
-for file in os.listdir(DATA_PATH):
-    if file.endswith(".txt") and "OUTPUT" in file:
-        with open(os.path.join(DATA_PATH, file), 'r') as f:
-            OUTPUTS = len(f.read().split('#'))
-            break
-if OUTPUTS is None:
-    print("No labels found, exiting...")
-    exit()
+if INPUTS == "auto":
+    INPUTS = None
+    for file in os.listdir(DATA_PATH):
+        if file.endswith(".txt") and "INPUT" in file:
+            with open(os.path.join(DATA_PATH, file), 'r') as f:
+                INPUTS = len(f.read().split('#'))
+                break
+    if INPUTS is None:
+        print("No labels found, exiting...")
+        exit()
+
+if OUTPUTS == "auto":
+    OUTPUTS = None
+    for file in os.listdir(DATA_PATH):
+        if file.endswith(".txt") and "OUTPUT" in file:
+            with open(os.path.join(DATA_PATH, file), 'r') as f:
+                OUTPUTS = len(f.read().split('#'))
+                break
+    if OUTPUTS is None:
+        print("No labels found, exiting...")
+        exit()
 
 IMG_COUNT = 0
 for file in os.listdir(DATA_PATH):
@@ -75,6 +89,7 @@ print()
 print(timestamp() + "Training settings:")
 print(timestamp() + "> Epochs:", NUM_EPOCHS)
 print(timestamp() + "> Batch size:", BATCH_SIZE)
+print(timestamp() + "> Inputs:", INPUTS)
 print(timestamp() + "> Outputs:", OUTPUTS)
 print(timestamp() + "> Images:", IMG_COUNT)
 print(timestamp() + "> Image width:", IMG_WIDTH)
@@ -110,20 +125,21 @@ if CACHE:
 
                 with open(os.path.join(DATA_PATH, file.split('.')[0].replace("IMAGE", "INPUT") + ".txt"), 'r') as f:
                     x, y, speed, rotation = f.read().split('#')
-                    inputs.append([float(x), float(y), float(speed), float(rotation)])
+                    inputs.append([float(x), float(y), float(rotation)])
 
                 with open(os.path.join(DATA_PATH, file.split('.')[0].replace("IMAGE", "OUTPUT") + ".txt"), 'r') as f:
                     steering, throttle, brake = f.read().split('#')
-                    labels.append([float(steering), float(throttle), float(brake)])
+                    labels.append([float(steering)])
 
             if len(images) % round(len(files) / 100) == 0:
                 print(f"\r{timestamp()}Caching {type} dataset... ({round(100 * len(images) / len(files))}%)", end='', flush=True)
 
-        return np.array(images, dtype=np.float32), np.array(inputs, dtype=np.float32), np.array(outputs, dtype=np.float32)
+        return np.array(images, dtype=np.float32), np.array(inputs, dtype=np.float32), np.array(labels, dtype=np.float32)
 
     class CustomDataset(Dataset):
-        def __init__(self, images, labels, transform=None):
+        def __init__(self, images, inputs, labels, transform=None):
             self.images = images
+            self.inputs = inputs
             self.labels = labels
             self.transform = transform
 
@@ -132,9 +148,10 @@ if CACHE:
 
         def __getitem__(self, idx):
             image = self.images[idx]
+            input = self.inputs[idx]
             label = self.labels[idx]
             image = self.transform(image)
-            return image, torch.as_tensor(label, dtype=torch.float32)
+            return image, torch.as_tensor(input, dtype=torch.float32), torch.as_tensor(label, dtype=torch.float32)
 
 else:
 
@@ -159,12 +176,12 @@ else:
             inputs = []
             with open(os.path.join(DATA_PATH, file.split('.')[0].replace("IMAGE", "INPUT") + ".txt"), 'r') as f:
                 x, y, speed, rotation = f.read().split('#')
-                inputs.append([float(x), float(y), float(speed), float(rotation)])
+                inputs.append([float(x), float(y), float(rotation)])
 
             labels = []
             with open(os.path.join(DATA_PATH, file.split('.')[0].replace("IMAGE", "OUTPUT") + ".txt"), 'r') as f:
                 steering, throttle, brake = f.read().split('#')
-                labels.append([float(steering), float(throttle), float(brake)])
+                labels.append([float(steering)])
 
             image = np.array(img, dtype=np.float32)
             image = self.transform(image)
@@ -179,16 +196,18 @@ class ConvolutionalNeuralNetwork(nn.Module):
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
         self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
         self._to_linear = 64 * (IMG_WIDTH // 8) * (IMG_HEIGHT // 8)
-        self.fc1 = nn.Linear(self._to_linear, 500)
+        self.fc1 = nn.Linear(self._to_linear + INPUTS, 500)
         self.fc2 = nn.Linear(500, OUTPUTS)
         self.dropout = nn.Dropout(DROPOUT)
 
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))  # 420x220 -> 210x110
-        x = self.pool(F.relu(self.conv2(x)))  # 210x110 -> 105x55
-        x = self.pool(F.relu(self.conv3(x)))  # 105x55 -> 52x27
-        x = x.view(-1, self._to_linear)  # Flatten the tensor
-        x = F.relu(self.fc1(x))
+    def forward(self, x, y):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = x.view(-1, self._to_linear)
+        x = torch.flatten(x, 1)
+        x = torch.cat((x, y), dim=1)
+        x = self.fc1(x)
         x = self.dropout(x)
         x = self.fc2(x)
         return x
@@ -252,10 +271,10 @@ def main():
     val_files = all_files[train_size:]
 
     if CACHE:
-        train_images, train_labels = load_data(train_files, "train")
-        val_images, val_labels = load_data(val_files, "val")
-        train_dataset = CustomDataset(train_images, train_labels, transform=train_transform)
-        val_dataset = CustomDataset(val_images, val_labels, transform=val_transform)
+        train_images, train_inputs, train_labels = load_data(train_files, "train")
+        val_images, val_inputs, val_labels = load_data(val_files, "val")
+        train_dataset = CustomDataset(train_images, train_inputs, train_labels, transform=train_transform)
+        val_dataset = CustomDataset(val_images, val_inputs, val_labels, transform=val_transform)
     else:
         train_dataset = CustomDataset(train_files, transform=train_transform)
         val_dataset = CustomDataset(val_files, transform=val_transform)
@@ -264,7 +283,7 @@ def main():
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=SHUFFLE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=DROP_LAST)
 
     # Initialize scaler, loss function, optimizer and scheduler
-    scaler = GradScaler()
+    scaler = GradScaler(device=DEVICE)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = lr_scheduler.OneCycleLR(optimizer, max_lr=MAX_LEARNING_RATE, steps_per_epoch=len(train_dataloader), epochs=NUM_EPOCHS)
@@ -331,10 +350,10 @@ def main():
         model.train()
         running_training_loss = 0.0
         for i, data in enumerate(train_dataloader, 0):
-            inputs, labels = data[0].to(DEVICE, non_blocking=True), data[1].to(DEVICE, non_blocking=True)
+            images, inputs, labels = data[0].to(DEVICE, non_blocking=True), data[1].to(DEVICE, non_blocking=True), data[2].to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
-            with autocast():
-                outputs = model(inputs)
+            with autocast(device_type=str(DEVICE)):
+                outputs = model(images, inputs)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -352,10 +371,10 @@ def main():
         # Validation phase
         model.eval()
         running_validation_loss = 0.0
-        with torch.no_grad(), autocast():
+        with torch.no_grad(), autocast(device_type=str(DEVICE)):
             for i, data in enumerate(val_dataloader, 0):
-                inputs, labels = data[0].to(DEVICE, non_blocking=True), data[1].to(DEVICE, non_blocking=True)
-                outputs = model(inputs)
+                images, inputs, labels = data[0].to(DEVICE, non_blocking=True), data[1].to(DEVICE, non_blocking=True), data[2].to(DEVICE, non_blocking=True)
+                outputs = model(images, inputs)
                 loss = criterion(outputs, labels)
                 running_validation_loss += loss.item()
         running_validation_loss /= len(val_dataloader)
@@ -418,35 +437,6 @@ def main():
     # Save the last model
     print(timestamp() + "Saving the last model...")
 
-    torch.cuda.empty_cache()
-
-    model.eval()
-    total_train = 0
-    correct_train = 0
-    with torch.no_grad():
-        for data in train_dataloader:
-            images, labels = data
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total_train += labels.size(0)
-            correct_train += (predicted == torch.argmax(labels, dim=1)).sum().item()
-    training_dataset_accuracy = str(round(100 * (correct_train / total_train), 2)) + "%"
-
-    torch.cuda.empty_cache()
-
-    total_val = 0
-    correct_val = 0
-    with torch.no_grad():
-        for data in val_dataloader:
-            images, labels = data
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total_val += labels.size(0)
-            correct_val += (predicted == torch.argmax(labels, dim=1)).sum().item()
-    validation_dataset_accuracy = str(round(100 * (correct_val / total_val), 2)) + "%"
-
     metadata_optimizer = str(optimizer).replace('\n', '')
     metadata_criterion = str(criterion).replace('\n', '')
     metadata_model = str(model).replace('\n', '')
@@ -480,9 +470,7 @@ def main():
                 f"training_size#{train_size}",
                 f"validation_size#{val_size}",
                 f"training_loss#{best_model_training_loss}",
-                f"validation_loss#{best_model_validation_loss}",
-                f"training_dataset_accuracy#{training_dataset_accuracy}",
-                f"validation_dataset_accuracy#{validation_dataset_accuracy}")
+                f"validation_loss#{best_model_validation_loss}")
     metadata = {"data": metadata}
     metadata = {data: str(value).encode("ascii") for data, value in metadata.items()}
 
@@ -499,35 +487,6 @@ def main():
 
     # Save the best model
     print(timestamp() + "Saving the best model...")
-
-    torch.cuda.empty_cache()
-
-    best_model.eval()
-    total_train = 0
-    correct_train = 0
-    with torch.no_grad():
-        for data in train_dataloader:
-            images, labels = data
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = best_model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total_train += labels.size(0)
-            correct_train += (predicted == torch.argmax(labels, dim=1)).sum().item()
-    training_dataset_accuracy = str(round(100 * (correct_train / total_train), 2)) + "%"
-
-    torch.cuda.empty_cache()
-
-    total_val = 0
-    correct_val = 0
-    with torch.no_grad():
-        for data in val_dataloader:
-            images, labels = data
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = best_model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total_val += labels.size(0)
-            correct_val += (predicted == torch.argmax(labels, dim=1)).sum().item()
-    validation_dataset_accuracy = str(round(100 * (correct_val / total_val), 2)) + "%"
 
     metadata_optimizer = str(optimizer).replace('\n', '')
     metadata_criterion = str(criterion).replace('\n', '')
@@ -562,9 +521,7 @@ def main():
                 f"training_size#{train_size}",
                 f"validation_size#{val_size}",
                 f"training_loss#{training_loss}",
-                f"validation_loss#{validation_loss}",
-                f"training_dataset_accuracy#{training_dataset_accuracy}",
-                f"validation_dataset_accuracy#{validation_dataset_accuracy}")
+                f"validation_loss#{validation_loss}")
     metadata = {"data": metadata}
     metadata = {data: str(value).encode("ascii") for data, value in metadata.items()}
 

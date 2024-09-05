@@ -3,7 +3,6 @@ from SDKController import SCSController
 from torchvision import transforms
 import ScreenCapture
 import numpy as np
-import keyboard
 import torch
 import math
 import time
@@ -12,7 +11,8 @@ import mss
 import os
 
 OS = os.name
-NAME = "ETS2-Parking-ML Data Collection"
+NAME = "ETS2-Parking-ML"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 PATH = os.path.dirname(os.path.dirname(__file__)).replace("\\", "/") + "/"
 
 if OS == "nt":
@@ -20,15 +20,6 @@ if OS == "nt":
     import win32gui, win32con
 
 LastScreenCaptureCheck = 0
-LastKeyPressed = False
-LastPosition = 0, 0
-LastState = False
-LastCapture = 0
-CaptureFps = 2
-State = False
-Key = "f"
-
-CAPTURE = []
 
 cv2.namedWindow(NAME, cv2.WINDOW_NORMAL)
 
@@ -180,6 +171,64 @@ def ConvertToScreenCoordinate(x:float, y:float, z:float):
     return screen_x, screen_y, distance
 
 
+MODEL_PATH = ""
+for file in os.listdir(f"{PATH}Models"):
+    if file.endswith(".pt"):
+        MODEL_PATH = f"{PATH}Models/{file}"
+        break
+if MODEL_PATH == "":
+    print("No model found.")
+    exit()
+
+print(f"Model: {MODEL_PATH}")
+
+metadata = {"data": []}
+model = torch.jit.load(os.path.join(MODEL_PATH), _extra_files=metadata, map_location=DEVICE)
+model.eval()
+
+metadata = eval(metadata["data"])
+for var in metadata:
+    if "classes" in var:
+        CLASSES = int(var.split("#")[1])
+    if "image_width" in var:
+        IMG_WIDTH = int(var.split("#")[1])
+    if "image_height" in var:
+        IMG_HEIGHT = int(var.split("#")[1])
+    if "image_channels" in var:
+        IMG_CHANNELS = str(var.split("#")[1])
+    if "training_dataset_accuracy" in var:
+        print("Training dataset accuracy: " + str(var.split("#")[1]))
+    if "validation_dataset_accuracy" in var:
+        print("Validation dataset accuracy: " + str(var.split("#")[1]))
+    if "val_transform" in var:
+        transform = var.replace("\\n", "\n").replace('\\', '').split("#")[1]
+        transform_list = []
+        transform_parts = transform.strip().split("\n")
+        for part in transform_parts[1:-1]:
+            part = part.strip()
+            if part:
+                try:
+                    transform_args = []
+                    transform_name = part.split("(")[0]
+                    if "(" in part:
+                        args = part.split("(")[1][:-1].split(",")
+                        for arg in args:
+                            try:
+                                transform_args.append(int(arg.strip()))
+                            except ValueError:
+                                try:
+                                    transform_args.append(float(arg.strip()))
+                                except ValueError:
+                                    transform_args.append(arg.strip())
+                    if transform_name == "ToTensor":
+                        transform_list.append(transforms.ToTensor())
+                    else:
+                        transform_list.append(getattr(transforms, transform_name)(*transform_args))
+                except (AttributeError, IndexError, ValueError):
+                    print(f"Skipping or failed to create transform: {part}")
+        transform = transforms.Compose(transform_list)
+
+
 while True:
     CurrentTime = time.time()
 
@@ -192,6 +241,7 @@ while True:
         if BACKGROUND.shape[0] != height or BACKGROUND.shape[1] != width:
             BACKGROUND = np.zeros((height, width, 3), np.uint8)
     except:
+        Controller.close()
         exit()
 
     if data["api"]["scsValues"]["telemetryPluginRevision"] < 2:
@@ -335,20 +385,22 @@ while True:
         frame = cv2.warpPerspective(frame, matrix, (cropped_width, cropped_height))
 
 
-    KeyPressed = keyboard.is_pressed(Key)
-    if LastKeyPressed == True and KeyPressed == False:
-        State = not State
-    LastKeyPressed = KeyPressed
+    target_x = 10509.855651855469
+    target_z = -9956.846969604492
+    target_rotation = 0.7545529007911682
 
-    if LastState == True and State == False:
-        # export the capture
-        ...
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame = cv2.resize(frame, (IMG_WIDTH, IMG_HEIGHT))
+    frame = np.array(frame, dtype=np.float32) / 255.0
+    input = truck_x - target_x, truck_z - target_z, target_rotation - truck_rotation_x
 
-    BACKGROUND[0:BACKGROUND.shape[0] - 1, 0:round(BACKGROUND.shape[1] * 0.5)] = cv2.resize(frame, (round(BACKGROUND.shape[1] * 0.5), round(BACKGROUND.shape[0] - 1)))
+    with torch.no_grad():
+        output = model(transform(frame).unsqueeze(0).to(DEVICE), torch.as_tensor(input, dtype=torch.float32).unsqueeze(0).to(DEVICE)).tolist()[0]
 
-    x1, y1, x2, y2 = round(BACKGROUND.shape[1] * 0.5 + 10), round(BACKGROUND.shape[0] - BACKGROUND.shape[1] * 0.5 + 9), BACKGROUND.shape[1] - 11, BACKGROUND.shape[0] - 11
-    cv2.rectangle(BACKGROUND, (x1, y1), (x2, y2), (0, 255, 0) if State else (0, 0, 255), 1)
+    print(output)
+    #print(truck_x, truck_z, truck_rotation_x)
 
+    Controller.steering = output[0]
 
-    cv2.imshow(NAME, BACKGROUND)
+    cv2.imshow(NAME, frame)
     cv2.waitKey(1)
